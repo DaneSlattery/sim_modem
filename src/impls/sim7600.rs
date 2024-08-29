@@ -1,5 +1,7 @@
 use core::fmt::Display;
 
+use at_commands::{builder::CommandBuilder, parser::CommandParser};
+
 use crate::{error::ModemError, CommunicationMode, SimModem};
 
 pub struct SIM7600(CommunicationMode);
@@ -16,29 +18,64 @@ impl Default for SIM7600 {
     }
 }
 
-impl<T: embedded_io::Read + embedded_io::Write, const N: usize> SimModem<T, N> for SIM7600 {
-    fn negotiate(&mut self, comm: &mut T, mut buffer: [u8; N]) -> Result<(), ModemError> {
-        reset(comm, &mut buffer)?;
+#[cfg(not(feature = "std"))]
+impl<T: embedded_io::Read + embedded_io::Write> SimModem<T> for SIM7600 {
+    fn negotiate(&mut self, comm: &mut T, buffer: &mut [u8]) -> Result<(), ModemError> {
+        reset(comm, buffer)?;
 
-        //disable echo
-        set_echo(comm, &mut buffer, false)?;
+        // //disable echo
+        // set_echo(comm, &mut buffer, false)?;
 
-        // get signal quality
-        let (rssi, ber) = get_signal_quality(comm, &mut buffer)?;
-        log::info!("RSSI = {rssi}");
-        log::info!("BER = {ber}");
-        // get iccid
-        let iccid = get_iccid(comm, &mut buffer)?;
-        log::info!("ICCID = [{}]", iccid);
+        // // get signal quality
+        // let (rssi, ber) = get_signal_quality(comm, &mut buffer)?;
+        // log::info!("RSSI = {rssi}");
+        // log::info!("BER = {ber}");
+        // // get iccid
+        // let iccid = get_iccid(comm, &mut buffer)?;
+        // log::info!("ICCID = [{}]", iccid);
 
-        // check pdp network reg
-        read_gprs_registration_status(comm, &mut buffer)?;
+        // // check pdp network reg
+        // read_gprs_registration_status(comm, &mut buffer)?;
 
-        //configure apn
-        set_pdp_context(comm, &mut buffer)?;
+        // //configure apn
+        // set_pdp_context(comm, &mut buffer)?;
 
-        // start ppp
-        set_data_mode(comm, &mut buffer)?;
+        // // start ppp
+        // set_data_mode(comm, &mut buffer)?;
+
+        self.0 = CommunicationMode::Data;
+        Ok(())
+    }
+
+    fn get_mode(&self) -> &CommunicationMode {
+        &self.0
+    }
+}
+
+#[cfg(feature = "std")]
+impl<T: std::io::Read + std::io::Write> SimModem<T> for SIM7600 {
+    fn negotiate(&mut self, comm: &mut T, buffer: &mut [u8]) -> Result<(), ModemError> {
+        reset(comm, buffer)?;
+
+        // //disable echo
+        // set_echo(comm, &mut buffer, false)?;
+
+        // // get signal quality
+        // let (rssi, ber) = get_signal_quality(comm, &mut buffer)?;
+        // log::info!("RSSI = {rssi}");
+        // log::info!("BER = {ber}");
+        // // get iccid
+        // let iccid = get_iccid(comm, &mut buffer)?;
+        // log::info!("ICCID = [{}]", iccid);
+
+        // // check pdp network reg
+        // read_gprs_registration_status(comm, &mut buffer)?;
+
+        // //configure apn
+        // set_pdp_context(comm, &mut buffer)?;
+
+        // // start ppp
+        // set_data_mode(comm, &mut buffer)?;
 
         self.0 = CommunicationMode::Data;
         Ok(())
@@ -178,3 +215,113 @@ impl RSSI {
         (GRAD * raw) + OFFSET
     }
 }
+
+fn reset<T: std::io::Read + std::io::Write>(
+    comm: &mut T,
+    buff: &mut [u8],
+) -> Result<(), ModemError> {
+    let cmd = CommandBuilder::create_execute(buff, false)
+        .named("ATZ0")
+        .finish()?;
+    log::info!("Send Reset");
+
+    comm.write(cmd).map_err(|_| ModemError::IO)?;
+
+    // read until terminator
+    let len = read_until_term(comm, buff)?;
+
+    log::info!("got response{:?}", core::str::from_utf8(&buff[..len]));
+    CommandParser::parse(&buff[..len])
+        .expect_identifier(b"ATZ0\r")
+        .expect_identifier(b"\r\nOK\r\n")
+        .finish()?;
+    Ok(())
+}
+
+// fn reset<T: embedded_io::Read + embedded_io::Write + embedded_io::BufRead>(
+//     comm: &mut T,
+//     buff: &mut [u8],
+// ) -> Result<(), ModemError> {
+//     let cmd = CommandBuilder::create_execute(buff, false)
+//         .named("ATZ0")
+//         .finish()?;
+//     log::info!("Send Reset");
+
+//     comm.write(cmd).map_err(|_| ModemError::IO)?;
+
+//     // read until terminator
+//     let len = read_until_term(comm, buff)?;
+
+//     log::info!("got response{:?}", core::str::from_utf8(&buff[..len]));
+//     CommandParser::parse(&buff[..len])
+//         .expect_identifier(b"ATZ0\r")
+//         .expect_identifier(b"\r\nOK\r\n")
+//         .finish()?;
+//     Ok(())
+// }
+const OK_TERMINATOR: &'static str = "\r\nOK\r\n";
+const ERR_TERMINATOR: &'static str = "\r\nERR\r\n";
+
+fn read_until_term<T: std::io::Read>(comm: &mut T, buff: &mut [u8]) -> Result<usize, ModemError> {
+    let mut pos = 0;
+
+    loop {
+        // start filling the buffer
+        let len = comm.read(&mut buff[pos..]).map_err(|_| ModemError::IO)?;
+        if len == 0 {
+            continue;
+        }
+        pos += len;
+        log::info!(
+            "Len: {}, data = {:?}",
+            len,
+            std::str::from_utf8(&buff[..pos])
+        );
+
+        let ok_len = OK_TERMINATOR.len();
+        if pos >= ok_len {
+            let end = &buff[pos - ok_len..pos];
+            log::info!(" end = {:?}", std::str::from_utf8(&buff[pos - ok_len..pos]));
+            if end == OK_TERMINATOR.as_bytes() {
+                // buff[..pos].copy_from_slice(data);
+                return Ok(pos);
+            }
+        }
+
+        let err_len = ERR_TERMINATOR.len();
+        if pos >= err_len {
+            let end = &buff[pos - err_len..pos];
+
+            if end == ERR_TERMINATOR.as_bytes() {
+                return Err(ModemError::DigestError);
+            }
+        }
+        // return Err(ModemError::DigestError);
+    }
+}
+
+// fn read_until_term<T: embedded_io::Read + BufRead>(
+//     comm: &mut T,
+//     buff: &mut [u8],
+// ) -> Result<usize, ModemError> {
+//     // let pos = 0;
+//     loop {
+//         let data = comm.fill_buf().map_err(|_| ModemError::IO)?;
+
+//         let ok_len = OK_TERMINATOR.len();
+//         let end = &data[data.len() - ok_len..];
+//         if end == OK_TERMINATOR.as_bytes() {
+//             buff[..data.len()].copy_from_slice(data);
+//             return Ok(data.len());
+//         }
+
+//         let err_len = ERR_TERMINATOR.len();
+
+//         let end = &data[data.len() - err_len..];
+
+//         if end == ERR_TERMINATOR.as_bytes() {
+//             buff.copy_from_slice(data);
+//             return Err(ModemError::DigestError);
+//         }
+//     }
+// }
